@@ -752,11 +752,11 @@ static void run_g_matrix(const char* sat_name,
     CUDA_CHECK(cudaMemcpy(d_z1, h_z1.data(), N_GRID*4*sizeof(double), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_z2, h_z2.data(), N_GRID*5*sizeof(double), cudaMemcpyHostToDevice));
 
-    /* 4. Compute G_gen on GPU (Phi integrals — this may take a few minutes) */
+    /* 4. Compute G_gen on GPU (Phi integrals — fast batched DGEMM version) */
     std::vector<double> h_G_gen((size_t)Ngrid * Ngrid, 0.0);
-    printf("[%s] Computing G_gen (%dx%d) — please wait...\n", sat_name, Ngrid, Ngrid);
-    g_matrix_gpu(d_z1, d_z2, h_omega1.data(), h_omega2.data(),
-                 N_GRID, n_om1, n_om2, 1.0 / NR, h_G_gen.data());
+    printf("[%s] Computing G_gen (%dx%d) — fast DGEMM path...\n", sat_name, Ngrid, Ngrid);
+    g_matrix_gpu_fast(d_z1, d_z2, h_omega1.data(), h_omega2.data(),
+                      N_GRID, n_om1, n_om2, 1.0 / NR, h_G_gen.data());
     cudaFree(d_z1); cudaFree(d_z2);
     printf("[%s] G_gen done.\n", sat_name);
 

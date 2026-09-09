@@ -265,6 +265,239 @@ void g_matrix_gpu(const double* d_z1, const double* d_z2,
 }
 
 // ===========================================================================
+// g_matrix_gpu_fast — replace 160,000 serialised kernel+sync+reduce calls
+// with 1 precompute kernel + 10 DGEMMs.
+//
+// Mathematics:
+//   Every entry G[b, a] = D_row[b] * delta^2 * D_col[a] * sum_i Phi_b(z_i) * W_a(z_i)
+//   where Phi_b is the row basis and W_a is the column weight.
+//
+//   Coefficients:
+//     D_row: 1 for b=0, 2 for b=1..k1-1 (Omega1), 1 for Omega2 rows
+//     D_col: 1 for Omega1 cols, 2 for Omega2 cols (real and imag)
+//
+//   Row bases  (k×N, freq×point):
+//     PhiCos1[b, i] = cos(2π z_i · om1_b)   b ∈ Omega1
+//     PhiCos2[b, i] = cos(2π z_i · om2_b)   b ∈ Omega2
+//     PhiSin2[b, i] = sin(2π z_i · om2_b)   b ∈ Omega2
+//
+//   Col weights (k×N):
+//     WCol1 [a,i] = [2π(v-dK)·ω]*sin(z·ω) − 4π²|ω|²K·cos(z·ω)   ω=om1_a
+//     WCol2r[a,i] = same formula with ω=om2_a
+//     WCol2i[a,i] = −(2π(v+dK)·ω)·cos(z·ω) + (−4π²|ω|²K)·sin(z·ω)  ω=om2_a
+//
+//   Special block G_33 (b∈Omega2_imag, a∈Omega2_imag):
+//     Uses *row* weights instead of Phi rows (k/m args are swapped in original):
+//     RowW1[j2,i] = −2π(v·mb)·sin(z·mb)
+//     RowW2[j2,i] = (−4π²|mb|²K)·sin(z·mb) − 2π(dK·mb)·cos(z·mb)
+//     G_33 = delta^2 * (RowW1 × PhiCos2^T + RowW2 × PhiSin2^T)
+//     (then D_col ×2 applies to the Omega2_imag cols, giving coeff=2)
+//
+//   Output: h_G row-major (same layout as g_matrix_gpu).
+// ===========================================================================
+#include <cublas_v2.h>
+
+// ---------------------------------------------------------------------------
+// Precompute kernel: all row bases and col weights in one pass.
+// Total threads = N*(k1+k2).
+// ---------------------------------------------------------------------------
+static __global__ void g_precompute_kernel(
+    const double* __restrict__ z1,     // N×4 row-major: x,y,vx,vy
+    const double* __restrict__ z2,     // N×5 row-major: x,y,K,dKx,dKy
+    const double* __restrict__ om1,    // k1×2 row-major
+    const double* __restrict__ om2,    // k2×2 row-major
+    int N, int k1, int k2,
+    double* PhiCos1,   // k1×N col-major
+    double* PhiCos2,   // k2×N col-major
+    double* PhiSin2,   // k2×N col-major
+    double* WCol1,     // k1×N col-major
+    double* WCol2r,    // k2×N col-major
+    double* WCol2i,    // k2×N col-major
+    double* RowW1,     // k2×N col-major  (G33 special row weight)
+    double* RowW2      // k2×N col-major  (G33 special row weight)
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // ---- Omega1 section ------------------------------------------------
+    if (tid < N * k1) {
+        int i = tid / k1, f = tid % k1;
+        double x = z1[i*4], y = z1[i*4+1], vx = z1[i*4+2], vy = z1[i*4+3];
+        double K  = z2[i*5+2], dKx = z2[i*5+3], dKy = z2[i*5+4];
+        double ka1 = om1[f*2], ka2 = om1[f*2+1];
+        double arg = 2.0*M_PI*(x*ka1 + y*ka2);
+        double s = sin(arg), c = cos(arg);
+        double Av  =  2.0*M_PI*(vx*ka1  + vy*ka2);
+        double AgK =  2.0*M_PI*(dKx*ka1 + dKy*ka2);
+        double AK  = -4.0*M_PI*M_PI*(ka1*ka1 + ka2*ka2)*K;
+        PhiCos1[f + (size_t)i*k1] = c;
+        WCol1  [f + (size_t)i*k1] = (Av - AgK)*s + AK*c;
+        return;
+    }
+
+    // ---- Omega2 section ------------------------------------------------
+    tid -= N * k1;
+    if (tid < N * k2) {
+        int i = tid / k2, f = tid % k2;
+        double x = z1[i*4], y = z1[i*4+1], vx = z1[i*4+2], vy = z1[i*4+3];
+        double K  = z2[i*5+2], dKx = z2[i*5+3], dKy = z2[i*5+4];
+        double ka1 = om2[f*2], ka2 = om2[f*2+1];
+        double arg = 2.0*M_PI*(x*ka1 + y*ka2);
+        double s = sin(arg), c = cos(arg);
+        double Av  =  2.0*M_PI*(vx*ka1  + vy*ka2);
+        double AgK =  2.0*M_PI*(dKx*ka1 + dKy*ka2);
+        double AK  = -4.0*M_PI*M_PI*(ka1*ka1 + ka2*ka2)*K;
+        PhiCos2[f + (size_t)i*k2] = c;
+        PhiSin2[f + (size_t)i*k2] = s;
+        WCol2r [f + (size_t)i*k2] = (Av - AgK)*s + AK*c;   // same formula as Omega1
+        WCol2i [f + (size_t)i*k2] = -(Av + AgK)*c + AK*s;  // f2+f6 formula for imag cols
+        RowW1  [f + (size_t)i*k2] = -Av * s;                // G33 row weight 1
+        RowW2  [f + (size_t)i*k2] = AK*s - AgK*c;          // G33 row weight 2
+    }
+}
+
+// Scale element at (row, col) in Ngrid×Ngrid col-major matrix by factor
+static __global__ void g_scale_rows(double* G, int Ngrid, int row_start, int row_end,
+                                     int col_start, int col_end, double factor) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int nrows = row_end - row_start, ncols = col_end - col_start;
+    if (idx >= nrows * ncols) return;
+    int r = idx % nrows + row_start;
+    int c = idx / nrows + col_start;
+    G[r + (size_t)c * Ngrid] *= factor;
+}
+
+// Transpose col-major (Ngrid×Ngrid) to row-major h_G[b*Ngrid+a] = G[b,a]
+// col-major G[b,a] is at offset b + a*Ngrid.
+// row-major h_G[b*Ngrid+a]. Since b+a*Ngrid ≠ b*Ngrid+a in general, need explicit transpose.
+static __global__ void g_transpose_d2h(const double* __restrict__ G_cm,
+                                        double* __restrict__ G_rm, int Ngrid) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= Ngrid * Ngrid) return;
+    int b = idx / Ngrid;  // row in output (row-major)
+    int a = idx % Ngrid;  // col in output
+    G_rm[idx] = G_cm[b + (size_t)a * Ngrid];  // G_cm[b, a] in col-major
+}
+
+void g_matrix_gpu_fast(const double* d_z1, const double* d_z2,
+                        const double* h_omega1, const double* h_omega2,
+                        int N, int k1, int k2, double delta, double* h_G)
+{
+    const int Ngrid = k1 + 2*k2;
+    const double dd = delta * delta;
+
+    cublasHandle_t blas;
+    cublasCreate(&blas);
+
+    // Upload omega arrays to GPU
+    double *d_om1 = nullptr, *d_om2 = nullptr;
+    cudaMalloc(&d_om1, k1*2*sizeof(double));
+    cudaMalloc(&d_om2, k2*2*sizeof(double));
+    cudaMemcpy(d_om1, h_omega1, k1*2*sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_om2, h_omega2, k2*2*sizeof(double), cudaMemcpyHostToDevice);
+
+    // Allocate precomputed matrices (freq × N, col-major)
+    double *PhiCos1, *PhiCos2, *PhiSin2;
+    double *WCol1, *WCol2r, *WCol2i;
+    double *RowW1, *RowW2;
+    cudaMalloc(&PhiCos1, (size_t)k1*N*sizeof(double));
+    cudaMalloc(&PhiCos2, (size_t)k2*N*sizeof(double));
+    cudaMalloc(&PhiSin2, (size_t)k2*N*sizeof(double));
+    cudaMalloc(&WCol1,   (size_t)k1*N*sizeof(double));
+    cudaMalloc(&WCol2r,  (size_t)k2*N*sizeof(double));
+    cudaMalloc(&WCol2i,  (size_t)k2*N*sizeof(double));
+    cudaMalloc(&RowW1,   (size_t)k2*N*sizeof(double));
+    cudaMalloc(&RowW2,   (size_t)k2*N*sizeof(double));
+
+    // Launch precompute kernel
+    int total = N * (k1 + k2);
+    g_precompute_kernel<<<(total+255)/256, 256>>>(
+        d_z1, d_z2, d_om1, d_om2, N, k1, k2,
+        PhiCos1, PhiCos2, PhiSin2,
+        WCol1, WCol2r, WCol2i, RowW1, RowW2);
+    cudaDeviceSynchronize();
+
+    // Allocate output G (Ngrid × Ngrid col-major) — initialise to 0
+    double *d_G = nullptr;
+    cudaMalloc(&d_G, (size_t)Ngrid*Ngrid*sizeof(double));
+    cudaMemset(d_G, 0, (size_t)Ngrid*Ngrid*sizeof(double));
+
+    // Helper: submatrix pointer in col-major d_G at (row_start, col_start)
+    auto blk = [&](int rs, int cs) -> double* {
+        return d_G + rs + (size_t)cs * Ngrid;
+    };
+
+    double one = 1.0, zero = 0.0;
+
+    // ----- 8 standard blocks (Phi × WCol^T) -----
+    // G_11  [0:k1,     0:k1    ]  col-major ldc=Ngrid
+    cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_T, k1, k1, N,
+                &dd, PhiCos1, k1, WCol1, k1, &zero, blk(0, 0), Ngrid);
+    // G_12  [0:k1,     k1:k1+k2]
+    cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_T, k1, k2, N,
+                &dd, PhiCos1, k1, WCol2r, k2, &zero, blk(0, k1), Ngrid);
+    // G_13  [0:k1,     k1+k2:Ngrid]
+    cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_T, k1, k2, N,
+                &dd, PhiCos1, k1, WCol2i, k2, &zero, blk(0, k1+k2), Ngrid);
+    // G_21  [k1:k1+k2, 0:k1    ]
+    cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_T, k2, k1, N,
+                &dd, PhiCos2, k2, WCol1, k1, &zero, blk(k1, 0), Ngrid);
+    // G_22  [k1:k1+k2, k1:k1+k2]
+    cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_T, k2, k2, N,
+                &dd, PhiCos2, k2, WCol2r, k2, &zero, blk(k1, k1), Ngrid);
+    // G_23  [k1:k1+k2, k1+k2:Ngrid]
+    cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_T, k2, k2, N,
+                &dd, PhiCos2, k2, WCol2i, k2, &zero, blk(k1, k1+k2), Ngrid);
+    // G_31  [k1+k2:Ngrid, 0:k1  ]
+    cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_T, k2, k1, N,
+                &dd, PhiSin2, k2, WCol1, k1, &zero, blk(k1+k2, 0), Ngrid);
+    // G_32  [k1+k2:Ngrid, k1:k1+k2]
+    cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_T, k2, k2, N,
+                &dd, PhiSin2, k2, WCol2r, k2, &zero, blk(k1+k2, k1), Ngrid);
+
+    // ----- G_33 special block -----
+    // Row-weight matrices (RowW1, RowW2) play the role of Phi here.
+    // G_33 = dd * (RowW1 × PhiCos2^T + RowW2 × PhiSin2^T)
+    // After D_col ×2: coeff becomes 2*dd.
+    cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_T, k2, k2, N,
+                &dd, RowW1, k2, PhiCos2, k2, &zero, blk(k1+k2, k1+k2), Ngrid);
+    cublasDgemm(blas, CUBLAS_OP_N, CUBLAS_OP_T, k2, k2, N,
+                &dd, RowW2, k2, PhiSin2, k2, &one,  blk(k1+k2, k1+k2), Ngrid);
+
+    cudaDeviceSynchronize();
+
+    // ----- Apply D_col: multiply Omega2 columns (k1..Ngrid-1) by 2 -----
+    {
+        int nelems = Ngrid * (Ngrid - k1);
+        g_scale_rows<<<(nelems+255)/256, 256>>>(
+            d_G, Ngrid, 0, Ngrid, k1, Ngrid, 2.0);
+    }
+
+    // ----- Apply D_row: multiply Omega1 rows 1..k1-1 by 2 -----
+    {
+        int nelems = (k1-1) * Ngrid;
+        if (nelems > 0)
+            g_scale_rows<<<(nelems+255)/256, 256>>>(
+                d_G, Ngrid, 1, k1, 0, Ngrid, 2.0);
+    }
+
+    cudaDeviceSynchronize();
+
+    // ----- Transpose col-major d_G → row-major for h_G -----
+    double *d_G_rm = nullptr;
+    cudaMalloc(&d_G_rm, (size_t)Ngrid*Ngrid*sizeof(double));
+    g_transpose_d2h<<<(Ngrid*Ngrid+255)/256, 256>>>(d_G, d_G_rm, Ngrid);
+    cudaDeviceSynchronize();
+    cudaMemcpy(h_G, d_G_rm, (size_t)Ngrid*Ngrid*sizeof(double), cudaMemcpyDeviceToHost);
+
+    cudaFree(PhiCos1); cudaFree(PhiCos2); cudaFree(PhiSin2);
+    cudaFree(WCol1);   cudaFree(WCol2r);  cudaFree(WCol2i);
+    cudaFree(RowW1);   cudaFree(RowW2);
+    cudaFree(d_om1);   cudaFree(d_om2);
+    cudaFree(d_G);     cudaFree(d_G_rm);
+    cublasDestroy(blas);
+}
+
+// ===========================================================================
 // Standalone verifier — compiled only when -DG_VERIFY_MAIN is set
 // ===========================================================================
 #ifdef G_VERIFY_MAIN

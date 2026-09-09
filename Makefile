@@ -23,7 +23,11 @@ ARCH     ?= $(shell python3 -c \
 # Eigen 3.4.0 — header-only, bundled locally
 EIGEN_INC = -I$(dir $(abspath $(lastword $(MAKEFILE_LIST))))eigen-3.4.0
 
-NVCCFLAGS = -O3 -std=c++14 --generate-code arch=compute_$(subst sm_,,$(ARCH)),code=$(ARCH)
+CUDA_INC   = /mnt/sdcard/cuda-13.2/targets/sbsa-linux/include
+CUDA_LIB   = /mnt/sdcard/cuda-13.2/targets/sbsa-linux/lib
+
+NVCCFLAGS = -O3 -std=c++17 --generate-code arch=compute_$(subst sm_,,$(ARCH)),code=$(ARCH) \
+            -I$(CUDA_INC) -L$(CUDA_LIB) -L$(CUDA_LIB)/stubs -L/usr/local/cuda-stubs -Wno-deprecated-gpu-targets
 
 .PHONY: all clean regrid_standalone aod_pipeline knn_impute_verify of_verify \
         smooth_verify g_matrix_verify obs_assembly_verify
@@ -56,7 +60,7 @@ aod_pipeline: main_pipeline.cu regrid_gpu.cu regrid_gpu.cuh \
 		fourier_basis.cu newgtry_gpu.cu matrix_expm.cu \
 		obs_assembly.cu gibbs_sampler.cu \
 		csv_io.cu \
-		-lcufft -lcublas -lcusolver -lcurand
+		-lcufft -lcublas -lcublasLt -lcusolver -lcurand
 	@echo "Built: aod_pipeline  (arch=$(ARCH))"
 
 # Standalone KNN verifier — feed any 60×60 input CSV and R reference CSV.

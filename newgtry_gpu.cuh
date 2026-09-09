@@ -24,3 +24,12 @@ void g_matrix_gpu(const double* d_z1,
                   const double* h_omega2,
                   int N, int k1, int k2, double delta,
                   double* h_G);
+
+// Fast version: replaces 160,000 serialised kernel+sync+reduce calls with
+// 1 precompute kernel + 10 DGEMMs. Produces identical results.
+void g_matrix_gpu_fast(const double* d_z1,
+                       const double* d_z2,
+                       const double* h_omega1,
+                       const double* h_omega2,
+                       int N, int k1, int k2, double delta,
+                       double* h_G);
